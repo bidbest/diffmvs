@@ -67,21 +67,19 @@ parser.add_argument('--scale', nargs="+", type=float, default=[0.01,0.01,0.01],
 parser.add_argument('--timesteps', nargs="+", type=int, default=[1000,1000,1000],
     help='timesteps')
 parser.add_argument('--sampling_timesteps', nargs="+", type=int, default=[1,1,1],
-    help='sampling_timesteps')
+    help='DDIM sampling timesteps')
 parser.add_argument('--hidden_dim', nargs="+", type=int, default=[0,32,32],
-    help='timesteps')
+    help='featurte dimension of hidden states for each stage')
 parser.add_argument('--context_dim', nargs="+", type=int, default=[32,32,16], 
-    help='timesteps')
-parser.add_argument('--interval_scale', type=float, default=1.06,
-    help='the number of depth values')
+    help='context dimension for each stage')
 parser.add_argument('--stage_iters', nargs="+", type=int, default=[3,3,3],
-    help='stage_iters')
+    help='GRU iterations for each stage')
 parser.add_argument('--cost_dim_stage', nargs="+", type=int, default=[4,4,4],
-    help='stage_iters')
+    help='feature dimension of group-wise correlation for each stage')
 parser.add_argument('--CostNum', nargs="+", type=int, default=[0, 4, 4],
     help='number of new samples in each diffusion timestep')
 parser.add_argument('--unet_dim', nargs="+", type=int, default=[0,16,8],
-    help='timesteps')
+    help='base feature dimension of unet for each stage')
 parser.add_argument('--conf_weight', type=float, default=1.0,
     help='weight for confidence learning')
 parser.add_argument('--min_radius', type=float, default=0.2,
