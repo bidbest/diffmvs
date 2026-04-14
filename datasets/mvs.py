@@ -54,7 +54,7 @@ class MVSDataset(Dataset):
                     src_views_1 = [int(x) for x in src_views_1]
                     score = src_views_score[2::2]
                     for i in range(len(src_views_1)):
-                        if score[i]>0.01 and src_views_1[i]!=ref_view:
+                        if src_views_1[i] != ref_view:
                             src_views.append(src_views_1[i])
                     if len(src_views) != 0:
                         self.metas += [("", ref_view, src_views)]

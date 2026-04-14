@@ -73,6 +73,12 @@ parser.add_argument('--geo_depth_thres', type=float, default=0.01,
     help='depth error threshold for geometric consistency filtering')
 parser.add_argument('--photo_thres', nargs="+", type=float, default=[0.3,0,0],
     help='confidence threshold for photometric consistency filtering')
+parser.add_argument('--filter_workers', type=int, default=0,
+    help='parallel workers for depth filtering; 0 auto-selects CPU threads - 1')
+parser.add_argument('--max_points_per_view', type=int, default=0,
+    help='maximum fused points contributed by each reference view; 0 disables the cap')
+parser.add_argument('--voxel_size', type=float, default=0.01,
+    help='voxel size in meters for fused point cloud downsampling; 0 disables it')
 
 
 # parse arguments and check
@@ -323,6 +329,9 @@ if __name__ == '__main__':
                     args.photo_thres,
                     args.method,
                     args.dataset,
+                    args.filter_workers,
+                    args.max_points_per_view,
+                    args.voxel_size,
                 )
             elif args.dataset == 'tank':
                 scan = scan.split('/')[1]
@@ -347,6 +356,9 @@ if __name__ == '__main__':
                     args.photo_thres,
                     args.method,
                     args.dataset,
+                    args.filter_workers,
+                    args.max_points_per_view,
+                    args.voxel_size,
                     )
     else:
         # demo
@@ -363,4 +375,7 @@ if __name__ == '__main__':
             args.photo_thres,
             args.method,
             args.dataset,
+            args.filter_workers,
+            args.max_points_per_view,
+            args.voxel_size,
         )

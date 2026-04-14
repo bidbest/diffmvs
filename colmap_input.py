@@ -1,9 +1,11 @@
 import argparse
 import cv2
+import multiprocessing as mp
 import numpy as np
 import os
 import shutil
 import struct
+import time
 from typing import Dict, List, NamedTuple, Tuple
 from PIL import Image
 
@@ -243,6 +245,163 @@ def quaternion_to_rotation_matrix(qvec: List[float]) -> np.ndarray:
          1 - 2 * qvec[1] ** 2 - 2 * qvec[2] ** 2]])
 
 
+_WORKER_VALID_POINT_IDS = None
+_WORKER_CAMERA_CENTERS = None
+_WORKER_POINT_XYZ = None
+_WORKER_THETA0 = None
+_WORKER_SIGMA1 = None
+_WORKER_SIGMA2 = None
+
+
+def log(message: str) -> None:
+    print(f"[colmap_input] {message}", flush=True)
+
+
+def progress_iter(iterable, total: int, desc: str):
+    try:
+        from tqdm import tqdm
+
+        return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True)
+    except ImportError:
+        def fallback():
+            start = time.monotonic()
+            last = start
+            for idx, item in enumerate(iterable, 1):
+                now = time.monotonic()
+                if idx == 1 or idx == total or now - last >= 10:
+                    elapsed = max(now - start, 1e-9)
+                    rate = idx / elapsed
+                    remaining = (total - idx) / rate if rate > 0 else 0
+                    log(
+                        f"{desc}: {idx}/{total} "
+                        f"({100.0 * idx / max(total, 1):.1f}%) "
+                        f"rate={rate:.1f}/s eta={remaining / 60:.1f}m"
+                    )
+                    last = now
+                yield item
+
+        return fallback()
+
+
+def build_pair_queue(num_images: int, pair_window: int) -> List[Tuple[int, int]]:
+    queue: List[Tuple[int, int]] = []
+    for i in range(num_images):
+        max_j = num_images if pair_window <= 0 else min(num_images, i + pair_window + 1)
+        for j in range(i + 1, max_j):
+            queue.append((i, j))
+    return queue
+
+
+def resolve_num_workers(num_workers: int, total_pairs: int) -> int:
+    if total_pairs == 0:
+        return 1
+    if num_workers < 0:
+        raise RuntimeError(f"num_workers must be >= 0: {num_workers}")
+    if num_workers > 0:
+        return num_workers
+    return max(1, min((os.cpu_count() or 1) - 1, total_pairs))
+
+
+def select_source_views(
+    sorted_scores: List[Tuple[int, float]],
+    max_sources: int,
+    min_score: float,
+    min_sources: int,
+) -> Tuple[List[Tuple[int, float]], bool]:
+    high_score = [item for item in sorted_scores if item[1] >= min_score]
+    fallback = sorted_scores[:min_sources]
+    fallback_used = len(high_score) < min_sources
+
+    selected: List[Tuple[int, float]] = []
+    seen = set()
+    for image_id, score in fallback + high_score:
+        if image_id in seen:
+            continue
+        selected.append((image_id, score))
+        seen.add(image_id)
+
+    selected = sorted(selected, key=lambda item: item[1], reverse=True)
+    if max_sources >= 0:
+        selected = selected[:max_sources]
+    return selected, fallback_used
+
+
+def log_view_selection_summary(view_sel: List[List[Tuple[int, float]]], fallback_refs: int) -> None:
+    source_counts = [len(items) for items in view_sel]
+    scores = [score for items in view_sel for _, score in items]
+    zero_scores = sum(1 for score in scores if score == 0)
+    if source_counts:
+        log(
+            "View selection summary: refs={} src/ref min/avg/max={}/{:.1f}/{} fallback_refs={}".format(
+                len(source_counts),
+                min(source_counts),
+                sum(source_counts) / len(source_counts),
+                max(source_counts),
+                fallback_refs,
+            )
+        )
+    if scores:
+        log(
+            "View selection scores: min/avg/max={:.6f}/{:.6f}/{:.6f} zero_scores={}/{}".format(
+                min(scores),
+                sum(scores) / len(scores),
+                max(scores),
+                zero_scores,
+                len(scores),
+            )
+        )
+
+
+def init_score_worker(
+    valid_point_ids,
+    camera_centers,
+    point_xyz,
+    theta0: float,
+    sigma1: float,
+    sigma2: float,
+) -> None:
+    global _WORKER_VALID_POINT_IDS
+    global _WORKER_CAMERA_CENTERS
+    global _WORKER_POINT_XYZ
+    global _WORKER_THETA0
+    global _WORKER_SIGMA1
+    global _WORKER_SIGMA2
+
+    _WORKER_VALID_POINT_IDS = valid_point_ids
+    _WORKER_CAMERA_CENTERS = camera_centers
+    _WORKER_POINT_XYZ = point_xyz
+    _WORKER_THETA0 = theta0
+    _WORKER_SIGMA1 = sigma1
+    _WORKER_SIGMA2 = sigma2
+
+
+def calc_score_fast(ind1: int, ind2: int) -> float:
+    common_ids = _WORKER_VALID_POINT_IDS[ind1] & _WORKER_VALID_POINT_IDS[ind2]
+    if not common_ids:
+        return 0.0
+
+    cam_center_i = _WORKER_CAMERA_CENTERS[ind1]
+    cam_center_j = _WORKER_CAMERA_CENTERS[ind2]
+    view_score = 0.0
+    for pid in common_ids:
+        p = _WORKER_POINT_XYZ[pid]
+        ray_i = cam_center_i - p
+        ray_j = cam_center_j - p
+        denom = np.linalg.norm(ray_i) * np.linalg.norm(ray_j)
+        if denom <= 0:
+            continue
+        cosine = np.clip(np.dot(ray_i, ray_j) / denom, -1.0, 1.0)
+        theta = (180 / np.pi) * np.arccos(cosine)
+        sigma = _WORKER_SIGMA1 if theta <= _WORKER_THETA0 else _WORKER_SIGMA2
+        view_score += np.exp(-((theta - _WORKER_THETA0) ** 2) / (2 * sigma ** 2))
+    return float(view_score)
+
+
+def score_pair(pair: Tuple[int, int]) -> Tuple[int, int, float]:
+    i, j = pair
+    return i, j, calc_score_fast(i, j)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert colmap results into input for PatchmatchNet")
 
@@ -252,6 +411,16 @@ if __name__ == "__main__":
     parser.add_argument("--theta0", type=float, default=5)
     parser.add_argument("--sigma1", type=float, default=1)
     parser.add_argument("--sigma2", type=float, default=10)
+    parser.add_argument("--num_workers", type=int, default=0,
+                        help="Pair-scoring worker processes. 0 auto-selects CPU threads - 1.")
+    parser.add_argument("--min_src_score", type=float, default=0.0,
+                        help="Minimum source-view score to keep before fallback.")
+    parser.add_argument("--min_src_images", type=int, default=0,
+                        help="Keep at least this many top-ranked source images when available.")
+    parser.add_argument("--pair_window", type=int, default=0,
+                        help="Only score image pairs within this index distance. 0 scores all pairs.")
+    parser.add_argument("--overwrite", action="store_true", default=False,
+                        help="Rewrite converted images even if numbered jpg outputs already exist.")
     parser.add_argument("--convert_format", action="store_true", default=False,
                         help="If set, convert image to jpg format.")
     parser.add_argument("--VGGT", action="store_true", default=False,
@@ -274,8 +443,18 @@ if __name__ == "__main__":
     cam_dir = os.path.join(args.output_folder, "cams")
     renamed_dir = os.path.join(args.output_folder, "images")
 
+    log(f"Reading COLMAP binary model from {model_dir}")
     cameras, images, points3d = read_model(model_dir, ".bin")
     num_images = len(images)
+    log(f"Loaded {len(cameras)} cameras, {num_images} registered images, {len(points3d)} sparse points")
+    if args.pair_window < 0:
+        raise RuntimeError(f"pair_window must be >= 0: {args.pair_window}")
+    if args.num_src_images == 0:
+        args.num_src_images = -1
+    if args.min_src_score < 0:
+        raise RuntimeError(f"min_src_score must be >= 0: {args.min_src_score}")
+    if args.min_src_images < 0:
+        raise RuntimeError(f"min_src_images must be >= 0: {args.min_src_images}")
 
     param_type: Dict[str, List[str]] = {
         "SIMPLE_PINHOLE": ["f", "cx", "cy"],
@@ -322,7 +501,8 @@ if __name__ == "__main__":
         ])
 
         global_feats = {}
-        for i in range(num_images):
+        log("Extracting VGGT/R2Former retrieval features")
+        for i in progress_iter(range(num_images), num_images, "r2former features"):
             img_path = os.path.join(image_dir, images[i].name)
             img = base_transform(Image.open(img_path).convert("RGB")).to(device)
             global_feat = model(img.unsqueeze(0))
@@ -330,7 +510,8 @@ if __name__ == "__main__":
 
     # intrinsic
     intrinsic: Dict[int, np.ndarray] = {}
-    for camera_id, cam in cameras.items():
+    log("Building intrinsics")
+    for camera_id, cam in progress_iter(cameras.items(), len(cameras), "intrinsics"):
         params_dict = {key: value for key, value in zip(param_type[cam.model], cam.params)}
         if "f" in param_type[cam.model]:
             params_dict["fx"] = params_dict["f"]
@@ -345,7 +526,8 @@ if __name__ == "__main__":
 
     # extrinsic
     extrinsic: List[np.ndarray] = []
-    for i in range(num_images):
+    log("Building extrinsics")
+    for i in progress_iter(range(num_images), num_images, "extrinsics"):
         e = np.zeros((4, 4))
         e[:3, :3] = quaternion_to_rotation_matrix(images[i].qvec)
         e[:3, 3] = images[i].tvec
@@ -355,7 +537,8 @@ if __name__ == "__main__":
 
     # depth range and interval
     depth_ranges: List[Tuple[float, float]] = []
-    for i in range(num_images):
+    log("Estimating per-image sparse depth ranges")
+    for i in progress_iter(range(num_images), num_images, "depth ranges"):
         zs = []
         for p3d_id in images[i].point3d_ids:
             if p3d_id == -1:
@@ -364,6 +547,8 @@ if __name__ == "__main__":
                 extrinsic[i], [points3d[p3d_id].xyz[0], points3d[p3d_id].xyz[1], points3d[p3d_id].xyz[2], 1])
             zs.append(transformed[2].item())
         zs_sorted = sorted(zs)
+        if not zs_sorted:
+            raise RuntimeError(f"No sparse depths available for image {images[i].name}")
         # relaxed depth range
         depth_min = zs_sorted[int(len(zs) * .01)]
         depth_max = zs_sorted[int(len(zs) * .99)]
@@ -371,57 +556,80 @@ if __name__ == "__main__":
         depth_ranges.append((depth_min, depth_max))
     print("depth_ranges[0]\n", depth_ranges[0], end="\n\n")
 
-    def calc_score(ind1: int, ind2: int) -> float:
-        id_i = images[ind1].point3d_ids
-        id_j = images[ind2].point3d_ids
-        id_intersect = [it for it in id_i if it in id_j]
-        cam_center_i = -np.matmul(extrinsic[ind1][:3, :3].transpose(), extrinsic[ind1][:3, 3:4])[:, 0]
-        cam_center_j = -np.matmul(extrinsic[ind2][:3, :3].transpose(), extrinsic[ind2][:3, 3:4])[:, 0]
-        view_score_ = 0.0
-        for pid in id_intersect:
-            if pid == -1:
-                continue
-            p = points3d[pid].xyz
-            theta = (180 / np.pi) * np.arccos(
-                np.dot(cam_center_i - p, cam_center_j - p) / np.linalg.norm(cam_center_i - p) / np.linalg.norm(
-                    cam_center_j - p))
-            view_score_ += np.exp(-(theta - args.theta0) * (theta - args.theta0) / (
-                    2 * (args.sigma1 if theta <= args.theta0 else args.sigma2) ** 2))
-        return view_score_
-
     def calc_score_vggt(ind1: int, ind2: int) -> float:
         view_score = float(np.dot(global_feats[images[ind1].name],
                                    global_feats[images[ind2].name].T))
         return view_score
 
     # view selection
-    score = np.zeros((num_images, num_images))
-    queue: List[Tuple[int, int]] = []
-    for i in range(num_images):
-        for j in range(i + 1, num_images):
-            queue.append((i, j))
+    queue = build_pair_queue(num_images, args.pair_window)
+    total_pairs = len(queue)
+    pair_mode = "all-pairs" if args.pair_window <= 0 else f"window={args.pair_window}"
+    log(f"Scoring source-view pairs: mode={pair_mode}, total_pairs={total_pairs}")
 
-    for i, j in queue:
-        if args.VGGT:
+    view_scores: List[List[Tuple[int, float]]] = [[] for _ in range(num_images)]
+    if args.VGGT:
+        for i, j in progress_iter(queue, total_pairs, "pair scores"):
             s = calc_score_vggt(i, j)
+            view_scores[i].append((j, s))
+            view_scores[j].append((i, s))
+    else:
+        log("Precomputing sparse point id sets and camera centers")
+        valid_point_ids = [set(p for p in image.point3d_ids if p != -1) for image in images]
+        camera_centers = [
+            -np.matmul(extrinsic[i][:3, :3].transpose(), extrinsic[i][:3, 3:4])[:, 0]
+            for i in range(num_images)
+        ]
+        point_xyz = {pid: np.array(point.xyz, dtype=np.float64) for pid, point in points3d.items()}
+        worker_count = resolve_num_workers(args.num_workers, total_pairs)
+        log(f"Pair-scoring workers: {worker_count}")
+        init_args = (
+            valid_point_ids,
+            camera_centers,
+            point_xyz,
+            args.theta0,
+            args.sigma1,
+            args.sigma2,
+        )
+        if worker_count == 1:
+            init_score_worker(*init_args)
+            results = (score_pair(pair) for pair in queue)
+            for i, j, s in progress_iter(results, total_pairs, "pair scores"):
+                view_scores[i].append((j, s))
+                view_scores[j].append((i, s))
         else:
-            s = calc_score(i, j)
-        score[i, j] = s
-        score[j, i] = s
+            ctx = mp.get_context("fork") if hasattr(os, "fork") else mp.get_context()
+            chunksize = max(1, min(1000, total_pairs // (worker_count * 16) if total_pairs else 1))
+            with ctx.Pool(worker_count, initializer=init_score_worker, initargs=init_args) as pool:
+                results = pool.imap_unordered(score_pair, queue, chunksize=chunksize)
+                for i, j, s in progress_iter(results, total_pairs, "pair scores"):
+                    view_scores[i].append((j, s))
+                    view_scores[j].append((i, s))
 
-    if args.num_src_images < 0:
-        args.num_src_images = num_images
+    max_sources = args.num_src_images if args.num_src_images >= 0 else -1
 
     view_sel: List[List[Tuple[int, float]]] = []
-    for i in range(num_images):
-        sorted_score = np.argsort(score[i])[::-1]
-        view_sel.append([(k, score[i, k]) for k in sorted_score[:args.num_src_images]])
+    fallback_refs = 0
+    log("Sorting source-view candidates")
+    for i in progress_iter(range(num_images), num_images, "view selection"):
+        sorted_score = sorted(view_scores[i], key=lambda item: item[1], reverse=True)
+        selected_views, fallback_used = select_source_views(
+            sorted_score,
+            max_sources,
+            args.min_src_score,
+            args.min_src_images,
+        )
+        if fallback_used:
+            fallback_refs += 1
+        view_sel.append(selected_views)
     print("view_sel[0]\n", view_sel[0], end="\n\n")
+    log_view_selection_summary(view_sel, fallback_refs)
 
     # write
     os.makedirs(cam_dir, exist_ok=True)
     os.makedirs(renamed_dir, exist_ok=True)
-    for i in range(num_images):
+    log(f"Writing camera files to {cam_dir}")
+    for i in progress_iter(range(num_images), num_images, "write cams"):
         with open(os.path.join(cam_dir, "%08d_cam.txt" % i), "w") as f:
             f.write("extrinsic\n")
             for j in range(4):
@@ -435,7 +643,9 @@ if __name__ == "__main__":
                 f.write("\n")
             f.write("\n%f %f \n" % (depth_ranges[i][0], depth_ranges[i][1]))
 
-    with open(os.path.join(args.output_folder, "pair.txt"), "w") as f:
+    pair_path = os.path.join(args.output_folder, "pair.txt")
+    log(f"Writing pair file to {pair_path}")
+    with open(pair_path, "w") as f:
         f.write("%d\n" % len(images))
         for i, sorted_score in enumerate(view_sel):
             f.write("%d\n%d " % (i, len(sorted_score)))
@@ -443,10 +653,21 @@ if __name__ == "__main__":
                 f.write("%d %f " % (image_id, s))
             f.write("\n")
 
-    for i in range(num_images):
+    log(f"Writing converted images to {renamed_dir}")
+    converted = 0
+    skipped = 0
+    for i in progress_iter(range(num_images), num_images, "write images"):
+        target_path = os.path.join(renamed_dir, "%08d.jpg" % i)
+        if os.path.exists(target_path) and not args.overwrite:
+            skipped += 1
+            continue
         if args.convert_format:
             img = cv2.imread(os.path.join(image_dir, images[i].name))
-            cv2.imwrite(os.path.join(renamed_dir, "%08d.jpg" % i), img)
+            if img is None:
+                raise RuntimeError(f"Failed to read image: {os.path.join(image_dir, images[i].name)}")
+            cv2.imwrite(target_path, img)
         else:
             shutil.copyfile(os.path.join(image_dir, images[i].name),
-                            os.path.join(renamed_dir, "%08d.jpg" % i))
+                            target_path)
+        converted += 1
+    log(f"Image write complete: converted={converted}, skipped_existing={skipped}")
